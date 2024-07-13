@@ -9,6 +9,8 @@ use std::{io, net::IpAddr};
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 use tracing::{debug, error, info};
 
 /// A NFS Tcp Connection Handler
@@ -17,6 +19,8 @@ pub struct NFSTcpListener<T: NFSFileSystem + Send + Sync + 'static> {
     port: u16,
     arcfs: Arc<T>,
     mount_signal: Option<mpsc::Sender<bool>>,
+    cancellation_token: CancellationToken,
+    task_tracker: TaskTracker,
 }
 
 pub fn generate_host_ip(hostnum: u16) -> String {
@@ -31,6 +35,7 @@ pub fn generate_host_ip(hostnum: u16) -> String {
 async fn process_socket(
     mut socket: tokio::net::TcpStream,
     context: RPCContext,
+    termination_signal: CancellationToken,
 ) -> Result<(), anyhow::Error> {
     let (mut message_handler, mut socksend, mut msgrecvchan) = SocketMessageHandler::new(&context);
     let _ = socket.set_nodelay(true);
@@ -45,6 +50,10 @@ async fn process_socket(
     });
     loop {
         tokio::select! {
+            _ = termination_signal.cancelled() => {
+                debug!("Termination signal received, shutting down");
+                return Ok(());
+            },
             _ = socket.readable() => {
                 let mut buf = [0; 128000];
 
@@ -98,7 +107,14 @@ pub trait NFSTcp: Send + Sync {
     fn set_mount_listener(&mut self, signal: mpsc::Sender<bool>);
 
     /// Loops forever and never returns handling all incoming connections.
-    async fn handle_forever(&self) -> io::Result<()>;
+    async fn handle_forever(&self) -> io::Result<()> {
+        loop {
+            self.handle().await?;
+        }
+    }
+
+    /// Handling all incoming connections, terminable.
+    async fn handle(&self) -> io::Result<()>;
 }
 
 impl<T: NFSFileSystem + Send + Sync + 'static> NFSTcpListener<T> {
@@ -159,12 +175,23 @@ impl<T: NFSFileSystem + Send + Sync + 'static> NFSTcpListener<T> {
             SocketAddr::V4(s) => s.port(),
             SocketAddr::V6(s) => s.port(),
         };
+
+        let cancellation_token = CancellationToken::new();
+        let task_tracker = TaskTracker::new();
+
         Ok(NFSTcpListener {
             listener,
             port,
             arcfs,
             mount_signal: None,
+            cancellation_token,
+            task_tracker,
         })
+    }
+
+    pub async fn stop(&self) -> TaskTracker {
+        self.cancellation_token.cancelled().await;
+        self.task_tracker.clone()
     }
 }
 
@@ -187,22 +214,30 @@ impl<T: NFSFileSystem + Send + Sync + 'static> NFSTcp for NFSTcpListener<T> {
         self.mount_signal = Some(signal);
     }
 
-    /// Loops forever and never returns handling all incoming connections.
-    async fn handle_forever(&self) -> io::Result<()> {
-        loop {
-            let (socket, _) = self.listener.accept().await?;
-            let context = RPCContext {
-                local_port: self.port,
-                client_addr: socket.peer_addr().unwrap().to_string(),
-                auth: crate::rpc::auth_unix::default(),
-                vfs: self.arcfs.clone(),
-                mount_signal: self.mount_signal.clone(),
-            };
-            info!("Accepting connection from {}", context.client_addr);
-            debug!("Accepting socket {:?} {:?}", socket, context);
-            tokio::spawn(async move {
-                let _ = process_socket(socket, context).await;
-            });
-        }
+    /// Handling all incoming connections, terminable.
+    async fn handle(&self) -> io::Result<()> {
+        let (socket, _) = self.listener.accept().await?;
+        let context = RPCContext {
+            local_port: self.port,
+            client_addr: socket.peer_addr().unwrap().to_string(),
+            auth: crate::rpc::auth_unix::default(),
+            vfs: self.arcfs.clone(),
+            mount_signal: self.mount_signal.clone(),
+        };
+
+        info!("Accepting connection from {}", context.client_addr);
+        debug!("Accepting socket {:?} {:?}", socket, context);
+
+        let addr = context.client_addr.clone();
+        let token = self.cancellation_token.clone();
+
+        self.task_tracker.spawn(async move {
+            let _ = process_socket(socket, context, token).await;
+            info!("Shutdown completed {:?}", addr);
+        });
+
+        self.task_tracker.close();
+
+        Ok(())
     }
 }
