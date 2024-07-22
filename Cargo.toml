@@ -22,7 +22,15 @@ bytestream = "0.4"
 byteorder = "1.4"
 num-traits = "0.2"
 num-derive = "0.3"
-tokio = { version="1", features = [ "net", "io-util", "sync", "fs", "rt", "macros" ], default-features = false }
+tokio = { version = "1", features = [
+    "net",
+    "io-util",
+    "sync",
+    "fs",
+    "rt",
+    "macros",
+], default-features = false }
+tokio-util = { version = "0.7.11", features = ["rt"] }
 futures = "0.3.21"
 tracing = "0.1.31"
 tracing-attributes = "0.1"
@@ -32,8 +40,11 @@ smallvec = "1.10.0"
 filetime = "0.2"
 
 # demo
-tracing-subscriber = { version = "0.3", features = ["tracing-log"], optional = true }
+tracing-subscriber = { version = "0.3", features = [
+    "tracing-log",
+], optional = true }
 intaglio = { version = "1.6", optional = true }
+
 
 [features]
 strict = []

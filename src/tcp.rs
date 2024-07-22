@@ -9,6 +9,7 @@ use std::{io, net::IpAddr};
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info};
 
 /// A NFS Tcp Connection Handler
@@ -28,23 +29,39 @@ pub fn generate_host_ip(hostnum: u16) -> String {
 }
 
 /// processes an established socket
-async fn process_socket(
+pub(crate) async fn process_socket(
     mut socket: tokio::net::TcpStream,
     context: RPCContext,
 ) -> Result<(), anyhow::Error> {
     let (mut message_handler, mut socksend, mut msgrecvchan) = SocketMessageHandler::new(&context);
     let _ = socket.set_nodelay(true);
 
+    let error_handler_cancellation = context.cancellation_token.clone();
+    let handler_cancellation = error_handler_cancellation.clone();
+
     tokio::spawn(async move {
         loop {
-            if let Err(e) = message_handler.read().await {
-                debug!("Message loop broken due to {:?}", e);
-                break;
+            tokio::select! {
+                m = message_handler.read() => {
+                    if let Err(e) = m {
+                        debug!("Message loop broken due to {:?}", e);
+                        break;
+                    }
+                },
+                _ = error_handler_cancellation.cancelled() => {
+                    debug!("Exiting error handler loop due to cancellation");
+                    break;
+                }
             }
         }
     });
+
     loop {
         tokio::select! {
+            _ = handler_cancellation.cancelled() => {
+                debug!("Exiting handler loop due to cancellation");
+                return Ok(());
+            },
             _ = socket.readable() => {
                 let mut buf = [0; 128000];
 
@@ -197,6 +214,7 @@ impl<T: NFSFileSystem + Send + Sync + 'static> NFSTcp for NFSTcpListener<T> {
                 auth: crate::rpc::auth_unix::default(),
                 vfs: self.arcfs.clone(),
                 mount_signal: self.mount_signal.clone(),
+                cancellation_token: CancellationToken::new(),
             };
             info!("Accepting connection from {}", context.client_addr);
             debug!("Accepting socket {:?} {:?}", socket, context);
