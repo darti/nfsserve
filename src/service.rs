@@ -5,7 +5,7 @@ use tokio::{
     sync::mpsc,
 };
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
-use tracing::{debug, info};
+use tracing::{debug, error, info};
 
 use crate::{context::RPCContext, tcp::process_socket, vfs::NFSFileSystem};
 
@@ -15,19 +15,26 @@ where
     T: NFSFileSystem + Send + Sync + 'static,
 {
     fs: Arc<T>,
+    listener: Arc<TcpListener>,
     mount_signal: Option<mpsc::Sender<bool>>,
     cancellation_token: CancellationToken,
     task_tracker: TaskTracker,
 }
 
 impl<T: NFSFileSystem + Send + Sync + 'static> NFSService<T> {
-    pub fn new(fs: T) -> Self {
-        Self {
+    pub async fn new<A>(fs: T, addr: A) -> io::Result<Self>
+    where
+        A: ToSocketAddrs,
+    {
+        let listener = TcpListener::bind(addr).await?;
+
+        Ok(Self {
             fs: Arc::new(fs),
+            listener: Arc::new(listener),
             mount_signal: None,
             cancellation_token: CancellationToken::new(),
             task_tracker: TaskTracker::new(),
-        }
+        })
     }
 
     pub async fn stop(&self) -> TaskTracker {
@@ -35,27 +42,21 @@ impl<T: NFSFileSystem + Send + Sync + 'static> NFSService<T> {
         self.task_tracker.clone()
     }
 
-    pub async fn handle<A>(&self, addr: A) -> io::Result<()>
-    where
-        A: ToSocketAddrs,
-    {
-        let listener = TcpListener::bind(addr).await?;
+    pub fn local_addr(&self) -> SocketAddr {
+        self.listener.local_addr().unwrap()
+    }
 
+    pub async fn handle(&self) -> io::Result<()> {
         self.task_tracker.close();
 
         loop {
             let (socket, _) = tokio::select! {
-                res = listener.accept() => res?,
+                res = self.listener.accept() => res?,
                 _ = self.cancellation_token.cancelled() => break,
             };
 
-            let port = match listener.local_addr().unwrap() {
-                SocketAddr::V4(s) => s.port(),
-                SocketAddr::V6(s) => s.port(),
-            };
-
             let context = RPCContext {
-                local_port: port,
+                local_port: self.local_addr().port(),
                 client_addr: socket.peer_addr().unwrap().to_string(),
                 auth: crate::rpc::auth_unix::default(),
                 vfs: self.fs.clone(),
@@ -66,7 +67,10 @@ impl<T: NFSFileSystem + Send + Sync + 'static> NFSService<T> {
             debug!("Accepting socket {:?} {:?}", socket, context);
 
             self.task_tracker.spawn(async move {
-                let _ = process_socket(socket, context).await;
+                match process_socket(socket, context).await {
+                    Ok(_) => info!("exiting"),
+                    Err(e) => error!("Socket processing error: {}", e),
+                };
                 info!("Stopped socked processing");
             });
         }
