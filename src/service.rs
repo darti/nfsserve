@@ -17,12 +17,17 @@ where
     fs: Arc<T>,
     listener: Arc<TcpListener>,
     mount_signal: Option<mpsc::Sender<bool>>,
-    cancellation_token: CancellationToken,
-    task_tracker: TaskTracker,
+    pub cancellation_token: CancellationToken,
+    pub task_tracker: TaskTracker,
 }
 
 impl<T: NFSFileSystem + Send + Sync + 'static> NFSService<T> {
-    pub async fn new<A>(fs: T, addr: A) -> io::Result<Self>
+    pub async fn new<A>(
+        fs: T,
+        addr: A,
+        cancellation_token: Option<CancellationToken>,
+        task_tracker: Option<TaskTracker>,
+    ) -> io::Result<Self>
     where
         A: ToSocketAddrs,
     {
@@ -32,14 +37,9 @@ impl<T: NFSFileSystem + Send + Sync + 'static> NFSService<T> {
             fs: Arc::new(fs),
             listener: Arc::new(listener),
             mount_signal: None,
-            cancellation_token: CancellationToken::new(),
-            task_tracker: TaskTracker::new(),
+            cancellation_token: cancellation_token.unwrap_or_else(|| CancellationToken::new()),
+            task_tracker: task_tracker.unwrap_or_else(|| TaskTracker::new()),
         })
-    }
-
-    pub async fn stop(&self) -> TaskTracker {
-        self.cancellation_token.cancelled().await;
-        self.task_tracker.clone()
     }
 
     pub fn local_addr(&self) -> SocketAddr {
@@ -47,32 +47,31 @@ impl<T: NFSFileSystem + Send + Sync + 'static> NFSService<T> {
     }
 
     pub async fn handle(&self) -> io::Result<()> {
-        self.task_tracker.close();
-
         loop {
-            let (socket, _) = tokio::select! {
-                res = self.listener.accept() => res?,
+            tokio::select! {
                 _ = self.cancellation_token.cancelled() => break,
-            };
+                res = self.listener.accept() => {
+                   let (socket, _) =  res?;
+                   let context = RPCContext {
+                       local_port: self.local_addr().port(),
+                       client_addr: socket.peer_addr().unwrap().to_string(),
+                       auth: crate::rpc::auth_unix::default(),
+                       vfs: self.fs.clone(),
+                       mount_signal: self.mount_signal.clone(),
+                       cancellation_token: self.cancellation_token.clone(),
+                   };
 
-            let context = RPCContext {
-                local_port: self.local_addr().port(),
-                client_addr: socket.peer_addr().unwrap().to_string(),
-                auth: crate::rpc::auth_unix::default(),
-                vfs: self.fs.clone(),
-                mount_signal: self.mount_signal.clone(),
-                cancellation_token: self.cancellation_token.clone(),
-            };
+                   debug!("Accepting socket {:?} {:?}", socket, context);
 
-            debug!("Accepting socket {:?} {:?}", socket, context);
-
-            self.task_tracker.spawn(async move {
-                match process_socket(socket, context).await {
-                    Ok(_) => info!("exiting"),
-                    Err(e) => error!("Socket processing error: {}", e),
-                };
-                info!("Stopped socked processing");
-            });
+                   self.task_tracker.spawn(async move {
+                       match process_socket(socket, context).await {
+                           Ok(_) => info!("exiting"),
+                           Err(e) => error!("Socket processing error: {}", e),
+                       };
+                       info!("Stopped socked processing");
+                   });
+                },
+            }
         }
 
         info!("Service stopped");
