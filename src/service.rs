@@ -65,10 +65,9 @@ impl<T: NFSFileSystem + Send + Sync + 'static> NFSService<T> {
 
                    self.task_tracker.spawn(async move {
                        match process_socket(socket, context).await {
-                           Ok(_) => info!("exiting"),
+                           Ok(_) => (),
                            Err(e) => error!("Socket processing error: {}", e),
                        };
-                       info!("Stopped socked processing");
                    });
                 },
             }
