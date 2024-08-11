@@ -9,7 +9,7 @@ use tracing::{debug, error, info};
 
 use crate::{context::RPCContext, tcp::process_socket, vfs::NFSFileSystem};
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct NFSService<T>
 where
     T: NFSFileSystem + Send + Sync + 'static,
